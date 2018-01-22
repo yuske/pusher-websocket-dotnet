@@ -1,110 +1,231 @@
 ﻿using Newtonsoft.Json;
 using System;
 using System.Diagnostics;
+using System.IO;
+using System.Text;
 using Newtonsoft.Json.Linq;
-using WebSocket4Net;
 using System.Threading;
+using System.Threading.Tasks;
+using vtortola.WebSockets;
+using vtortola.WebSockets.Rfc6455;
 
 namespace PusherClient
 {
     internal class Connection
     {
-        private WebSocket _websocket = null;
-        private string _socketId = null;
-        private string _url = null;
-        private Pusher _pusher = null;
-        private ConnectionState _state = ConnectionState.Initialized;
-        private bool _allowReconnect = true;
+        private WebSocketClient _client;
+        private WebSocket _websocket;
+        private Task _task;
+        private CancellationTokenSource _cts;
+        private readonly SemaphoreSlim _lockObject = new SemaphoreSlim(1);
+        private readonly string _url;
+        private readonly Pusher _pusher;
 
         public event ErrorEventHandler Error;
         public event ConnectedEventHandler Connected;
         public event ConnectionStateChangedEventHandler ConnectionStateChanged;
-        
-        private int _backOffMillis = 0;
 
-        private static readonly int MAX_BACKOFF_MILLIS = 10000;
-        private static readonly int BACK_OFF_MILLIS_INCREMENT = 1000;
+        internal string SocketID { get; private set; }
 
-        #region Properties
-
-        internal string SocketID
-        {
-            get
-            {
-                return _socketId;
-            }
-        }
-        internal ConnectionState State
-        {
-            get
-            {
-                return _state;
-            }
-        }
-
-        #endregion
+        internal ConnectionState State { get; private set; } = ConnectionState.Initialized;
 
         public Connection(Pusher pusher, string url)
         {
-            this._url = url;
-            this._pusher = pusher;
+            _url = url;
+            _pusher = pusher;
         }
 
-        #region Internal Methods
-
-        internal void Connect()
+        // the method is not thread-safe
+        public void Run()
         {
-            // TODO: Handle and test disconnection / errors etc
-            // TODO: Add 'connecting_in' event
-            var msg = string.Format("Connecting to: {0}", _url);
-            Pusher.Trace.TraceEvent(TraceEventType.Information, 0, msg);
+            Pusher.Trace.TraceEvent(TraceEventType.Information, 0, $"Connecting to: {_url}");
 
             ChangeState(ConnectionState.Connecting);
-            _allowReconnect = true;
 
-            _websocket = new WebSocket(_url);
-            _websocket.EnableAutoSendPing = true;
-            _websocket.AutoSendPingInterval = 1;
-            _websocket.Opened += websocket_Opened;
-            _websocket.Error += websocket_Error;
-            _websocket.Closed += websocket_Closed;
-            _websocket.MessageReceived += websocket_MessageReceived;
-            _websocket.Open();
+            _cts = new CancellationTokenSource();
+            _task = Task.Run(Receive, _cts.Token);
         }
 
-        internal void Disconnect()
+        // the method is not thread-safe
+        public void Stop()
         {
-            _allowReconnect = false;
-
-            _websocket.Opened -= websocket_Opened;
-            _websocket.Error -= websocket_Error;
-            _websocket.Closed -= websocket_Closed;
-            _websocket.MessageReceived -= websocket_MessageReceived;
-            _websocket.Close();
-
-            ChangeState(ConnectionState.Disconnected);
-        }
-
-        internal void Send(string message)
-        {
-            if (this.State == ConnectionState.Connected)
+            if (StopAsync().Wait(5000))
             {
-                Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Sending: " + message);
-                Debug.WriteLine("Sending: " + message);
-                _websocket.Send(message);
+                Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "The WebSocket task is not stopped.");
             }
         }
 
-        #endregion
+        public void Send(string message)
+        {
+            SendAsync(message).Wait();
+        }
 
-        #region Private Methods
+        public async Task StopAsync()
+        {
+            if (_cts == null || _task == null)
+                return;
+
+            _cts.Cancel();
+            await _task;
+            _task.Dispose();
+            _cts.Dispose();
+            _cts = null;
+            _task = null;
+        }
+
+        public async Task SendAsync(string message)
+        {
+            if (State != ConnectionState.Connected)
+            {
+                Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "The WebSocket state is not connected.");
+                return;
+            }
+
+            await _lockObject.WaitAsync(_cts.Token);
+            try
+            {
+                Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Sending: " + message);
+                Debug.WriteLine("Sending: " + message);
+
+                var data = Encoding.UTF8.GetBytes(message);
+                using (var writer = _websocket.CreateMessageWriter(WebSocketMessageType.Text))
+                {
+                    await writer.WriteAsync(data, 0, data.Length, _cts.Token);
+                }
+            }
+            catch (Exception e)
+            {
+                Pusher.Trace.TraceEvent(TraceEventType.Error, 0, "Error sending a data by WebSocket. " + e);
+            }
+            finally
+            {
+                _lockObject.Release();
+            }
+        }
+
+        private async Task Receive()
+        {
+            while (!_cts.Token.IsCancellationRequested)
+            {
+                if (_websocket == null || !_websocket.IsConnected)
+                {
+                    Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Trying to connect by WebSocket.");
+                    if (!await Connect())
+                    {
+                        // try to reconnect in 5 sec timeout
+                        await Task.Delay(TimeSpan.FromSeconds(5), _cts.Token);
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        using (var result = await _websocket.ReadMessageAsync(_cts.Token))
+                        {
+                            if (result.MessageType == WebSocketMessageType.Binary)
+                            {
+                                Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "Have got a binary message by WebSocket.");
+                            }
+                            else
+                            {
+                                using (var reader = new StreamReader(result, Encoding.UTF8))
+                                {
+                                    HandleMessage(await reader.ReadToEndAsync());
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        await Close();
+                        Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "Error WebSocket: " + e);
+                    }
+                }
+            }
+
+            await Close();
+        }
+
+        private async Task<bool> Connect()
+        {
+            try
+            {
+                await _lockObject.WaitAsync(_cts.Token);
+                try
+                {
+                    if (State != ConnectionState.Connecting)
+                    {
+                        ChangeState(ConnectionState.WaitingToReconnect);
+                    }
+
+                    _websocket?.Dispose();
+                    
+                    // create new connection
+                    var bufferSize = 1024 * 8; // 8KiB
+                    var bufferPoolSize = 100 * bufferSize; // 800KiB pool
+
+                    var options = new WebSocketListenerOptions
+                    {
+                        // set send buffer size (optional but recommended)
+                        SendBufferSize = bufferSize,
+                        // set buffer manager for buffers re-use (optional but recommended)
+                        BufferManager = BufferManager.CreateBufferManager(bufferPoolSize, bufferSize),
+                        // set timeout for slow connections
+                        NegotiationTimeout = TimeSpan.FromSeconds(20)
+                    };
+
+                    // register RFC6455 protocol implementation (required)
+                    options.Standards.RegisterRfc6455();
+
+                    // configure tcp transport (optional)
+                    options.Transports.ConfigureTcp(tcp =>
+                    {
+                        tcp.ReceiveBufferSize = bufferSize;
+                        tcp.SendBufferSize = bufferSize;
+                    });
+
+                    _client = new WebSocketClient(options);
+                    _websocket = await _client.ConnectAsync(new Uri(_url), _cts.Token);
+                    Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Websocket opened OK.");
+                }
+                finally
+                {
+                    _lockObject.Release();
+                }
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "The WebSocket connection attempt throws the exception. " + e);
+                return false;
+            }
+        }
+
+        private async Task Close()
+        {
+            await _lockObject.WaitAsync();
+            try
+            {
+                await _websocket.CloseAsync();
+                await _client.CloseAsync();
+                Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "Websocket connection has been closed");
+            }
+            catch (Exception e)
+            {
+                Pusher.Trace.TraceEvent(TraceEventType.Error, 0, "Error WebSocket closing. " + e);
+            }
+            finally
+            {
+                _lockObject.Release();
+                ChangeState(ConnectionState.Disconnected);
+            }
+        }
 
         private void ChangeState(ConnectionState state)
         {
-            this._state = state;
-
-            if (ConnectionStateChanged != null)
-                ConnectionStateChanged(this, this._state);
+            State = state;
+            ConnectionStateChanged?.Invoke(this, State);
         }
 
         private void RaiseError(PusherException error)
@@ -121,11 +242,11 @@ namespace PusherClient
             }
         }
 
-        private void websocket_MessageReceived(object sender, MessageReceivedEventArgs e)
+        private void HandleMessage(string receivedMessage)
         {
-            Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Websocket message received: " + e.Message);
+            Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Websocket message received: " + receivedMessage);
 
-            Debug.WriteLine(e.Message);
+            Debug.WriteLine(receivedMessage);
 
             // DeserializeAnonymousType will throw and error when an error comes back from pusher
             // It stems from the fact that the data object is a string normally except when an error is sent back
@@ -134,7 +255,7 @@ namespace PusherClient
             // bad:  "{\"event\":\"pusher:error\",\"data\":{\"code\":4201,\"message\":\"Pong reply not received\"}}"
             // good: "{\"event\":\"pusher:error\",\"data\":\"{\\\"code\\\":4201,\\\"message\\\":\\\"Pong reply not received\\\"}\"}";
 
-            var jObject = JObject.Parse(e.Message);
+            var jObject = JObject.Parse(receivedMessage);
 
             if (jObject["data"] != null && jObject["data"].Type != JTokenType.String)
                 jObject["data"] = jObject["data"].ToString(Formatting.None);
@@ -172,7 +293,7 @@ namespace PusherClient
 
                     case Constants.CHANNEL_SUBSCRIPTION_ERROR:
 
-                        RaiseError(new PusherException("Error received on channel subscriptions: " + e.Message, ErrorCodes.SubscriptionError));
+                        RaiseError(new PusherException("Error received on channel subscriptions: " + receivedMessage, ErrorCodes.SubscriptionError));
                         break;
 
                     case Constants.CHANNEL_MEMBER_ADDED:
@@ -217,48 +338,17 @@ namespace PusherClient
                 if (_pusher.Channels.ContainsKey(message.channel))
                     _pusher.Channels[message.channel].EmitEvent(message.@event, message.data);
             }
-
-            
-        }
-
-        private void websocket_Opened(object sender, EventArgs e)
-        {
-            Pusher.Trace.TraceEvent(TraceEventType.Information, 0, "Websocket opened OK.");
-        }
-
-        private void websocket_Closed(object sender, EventArgs e)
-        {
-            Pusher.Trace.TraceEvent(TraceEventType.Warning, 0, "Websocket connection has been closed");
-
-            ChangeState(ConnectionState.Disconnected);
-            _websocket = null;
-
-            if (_allowReconnect)
-            {
-                ChangeState(ConnectionState.WaitingToReconnect);
-                Thread.Sleep(_backOffMillis);
-                _backOffMillis = Math.Min(MAX_BACKOFF_MILLIS, _backOffMillis + BACK_OFF_MILLIS_INCREMENT);
-                Connect();
-            }
-        }
-
-        private void websocket_Error(object sender, SuperSocket.ClientEngine.ErrorEventArgs e)
-        {
-            Pusher.Trace.TraceEvent(TraceEventType.Error, 0, "Error: " + e.Exception);
-
-            // TODO: What happens here? Do I need to re-connect, or do I just log the issue?
         }
 
         private void ParseConnectionEstablished(string data)
         {
             var template = new { socket_id = String.Empty };
             var message = JsonConvert.DeserializeAnonymousType(data, template);
-            _socketId = message.socket_id;
+            SocketID = message.socket_id;
 
             ChangeState(ConnectionState.Connected);
 
-            if (Connected != null)
-                Connected(this);
+            Connected?.Invoke(this);
         }
 
         private void ParseError(string data)
@@ -275,7 +365,5 @@ namespace PusherClient
 
             RaiseError(new PusherException(parsed.message, error));
         }
-
-        #endregion
     }
 }

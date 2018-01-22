@@ -127,7 +127,7 @@ namespace PusherClient
 
                 _connection = new Connection(this, url);
                 RegisterEventsOnConnection();
-                _connection.Connect();
+                _connection.Run();
             }
         }
 
@@ -149,7 +149,7 @@ namespace PusherClient
         {
             UnregisterEventsOnDisconnection();
             MarkChannelsAsUnsubscribed();
-            _connection.Disconnect();
+            _connection.Stop();
             _connection = null;
         }
 
